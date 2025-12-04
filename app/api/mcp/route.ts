@@ -1,82 +1,89 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { createMcpHandler } from 'mcp-handler';
 import { put } from '@vercel/blob';
 import { nanoid } from 'nanoid';
+import { NextRequest } from 'next/server';
 
-const handler = createMcpHandler(
-  (server) => {
-    // 工具1: 上传 3D 文件到 Vercel Blob
-    server.tool(
-      'upload_3d_file',
-      'Upload a 3D model file (GLB/GLTF) to cloud storage',
-      {
-        fileName: z.string().describe('File name (e.g., model.glb)'),
-        fileData: z.string().describe('Base64 encoded file data'),
-        metadata: z.object({
-          title: z.string().optional(),
-          description: z.string().optional(),
-        }).optional(),
-      },
-      async ({ fileName, fileData, metadata }) => {
-        try {
-          // 解码 Base64
-          const buffer = Buffer.from(fileData, 'base64');
-          
-          // 上传到 Vercel Blob
-          const uniqueId = nanoid(10);
-          const blob = await put(
-            `3d-models/${uniqueId}-${fileName}`,
-            buffer,
-            {
-              access: 'public',
-              addRandomSuffix: false,
-            }
-          );
+// 创建 MCP 服务器实例
+const server = new McpServer({
+  name: '3D File Storage MCP Server',
+  version: '1.0.0',
+});
 
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: true,
-                  url: blob.url,
-                  downloadUrl: blob.downloadUrl,
-                  id: uniqueId,
-                  metadata: metadata || {},
-                }),
-              },
-            ],
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: (error as Error).message,
-                }),
-              },
-            ],
-            isError: true,
-          };
+// 工具1: 上传 3D 文件到 Vercel Blob
+server.tool(
+  'upload_3d_file',
+  'Upload a 3D model file (GLB/GLTF) to cloud storage',
+  {
+    fileName: z.string().describe('File name (e.g., model.glb)'),
+    fileData: z.string().describe('Base64 encoded file data'),
+    metadata: z.object({
+      title: z.string().optional(),
+      description: z.string().optional(),
+    }).optional(),
+  },
+  async ({ fileName, fileData, metadata }) => {
+    try {
+      // 解码 Base64 并转换为 Blob
+      const buffer = Buffer.from(fileData, 'base64');
+      const blob = new Blob([buffer]);
+      
+      // 上传到 Vercel Blob
+      const uniqueId = nanoid(10);
+      const uploadedBlob = await put(
+        `3d-models/${uniqueId}-${fileName}`,
+        blob,
+        {
+          access: 'public',
+          addRandomSuffix: false,
         }
-      }
-    );
+      );
 
-    // 工具2: 生成 3D 预览网页
-    server.tool(
-      'generate_3d_viewer',
-      'Generate a 3D viewer web page for a GLB/GLTF file',
-      {
-        modelUrl: z.string().url().describe('URL of the 3D model file'),
-        title: z.string().default('3D Model Viewer'),
-        backgroundColor: z.string().default('#111'),
-        cameraOrbit: z.string().default('45deg 75deg auto'),
-        exposure: z.number().default(1),
-        shadowIntensity: z.number().default(0.6),
-      },
-      async ({ modelUrl, title, backgroundColor, cameraOrbit, exposure, shadowIntensity }) => {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              url: uploadedBlob.url,
+              downloadUrl: uploadedBlob.downloadUrl,
+              id: uniqueId,
+              metadata: metadata || {},
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: (error as Error).message,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// 工具2: 生成 3D 预览网页
+server.tool(
+  'generate_3d_viewer',
+  'Generate a 3D viewer web page for a GLB/GLTF file',
+  {
+    modelUrl: z.string().url().describe('URL of the 3D model file'),
+    title: z.string().default('3D Model Viewer'),
+    backgroundColor: z.string().default('#111'),
+    cameraOrbit: z.string().default('45deg 75deg auto'),
+    exposure: z.number().default(1),
+    shadowIntensity: z.number().default(0.6),
+  },
+  async ({ modelUrl, title, backgroundColor, cameraOrbit, exposure, shadowIntensity }) => {
         const htmlContent = `<!doctype html>
 <html lang="en">
   <head>
@@ -178,76 +185,78 @@ const handler = createMcpHandler(
   </body>
 </html>`;
 
-        // 保存 HTML 到 Blob
-        const pageId = nanoid(10);
-        const htmlBlob = await put(
-          `3d-pages/${pageId}.html`,
-          htmlContent,
-          {
-            access: 'public',
-            addRandomSuffix: false,
-            contentType: 'text/html',
-          }
-        );
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: true,
-                pageUrl: htmlBlob.url,
-                pageId: pageId,
-                modelUrl: modelUrl,
-              }),
-            },
-          ],
-        };
+    // 保存 HTML 到 Blob
+    const pageId = nanoid(10);
+    const htmlBlob = await put(
+      `3d-pages/${pageId}.html`,
+      htmlContent,
+      {
+        access: 'public',
+        addRandomSuffix: false,
+        contentType: 'text/html',
       }
     );
 
-    // 工具3: 列出已上传的 3D 文件
-    server.tool(
-      'list_3d_files',
-      'List all uploaded 3D model files',
-      {},
-      async () => {
-        try {
-          // 注意：这需要 Vercel Blob 的 list 功能
-          // 简化版本，返回提示信息
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  message: 'List functionality requires Vercel Blob list API. Please check Vercel dashboard for file management.',
-                  tip: 'Visit https://vercel.com/dashboard/stores/blob to manage your files',
-                }),
-              },
-            ],
-          };
-        } catch (error) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  success: false,
-                  error: (error as Error).message,
-                }),
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-    );
-  },
-  {
-    name: '3D File Storage MCP Server',
-    version: '1.0.0',
-  },
-  { basePath: '/api' }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            pageUrl: htmlBlob.url,
+            pageId: pageId,
+            modelUrl: modelUrl,
+          }),
+        },
+      ],
+    };
+  }
 );
 
-export { handler as GET, handler as POST, handler as DELETE };
+// 工具3: 列出已上传的 3D 文件
+server.tool(
+  'list_3d_files',
+  'List all uploaded 3D model files',
+  {},
+  async () => {
+    try {
+      // 注意：这需要 Vercel Blob 的 list 功能
+      // 简化版本，返回提示信息
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              message: 'List functionality requires Vercel Blob list API. Please check Vercel dashboard for file management.',
+              tip: 'Visit https://vercel.com/dashboard/stores/blob to manage your files',
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: (error as Error).message,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// 处理 Next.js API 路由请求
+export async function POST(request: NextRequest) {
+  const transport = new StreamableHTTPServerTransport('api/mcp', server);
+  return transport.handleRequest(request);
+}
+
+export async function GET(request: NextRequest) {
+  const transport = new StreamableHTTPServerTransport('api/mcp', server);
+  return transport.handleRequest(request);
+}
