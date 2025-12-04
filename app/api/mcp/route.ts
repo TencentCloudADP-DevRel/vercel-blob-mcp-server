@@ -1,90 +1,151 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { put } from '@vercel/blob';
 import { nanoid } from 'nanoid';
-import { NextRequest } from 'next/server';
 
-// 创建 MCP 服务器实例
-const server = new McpServer({
-  name: '3D File Storage MCP Server',
-  version: '1.0.0',
-});
-
-// 工具1: 上传 3D 文件到 Vercel Blob
-server.tool(
-  'upload_3d_file',
-  'Upload a 3D model file (GLB/GLTF) to cloud storage',
+// MCP 工具定义
+const tools = [
   {
-    fileName: z.string().describe('File name (e.g., model.glb)'),
-    fileData: z.string().describe('Base64 encoded file data'),
-    metadata: z.object({
-      title: z.string().optional(),
-      description: z.string().optional(),
-    }).optional(),
+    name: 'upload_3d_file',
+    description: 'Upload a 3D model file (GLB/GLTF) to cloud storage',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fileName: {
+          type: 'string',
+          description: 'File name (e.g., model.glb)',
+        },
+        fileData: {
+          type: 'string',
+          description: 'Base64 encoded file data',
+        },
+        metadata: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            description: { type: 'string' },
+          },
+        },
+      },
+      required: ['fileName', 'fileData'],
+    },
   },
-  async ({ fileName, fileData, metadata }) => {
-    try {
-      // 解码 Base64 并转换为 Blob
-      const buffer = Buffer.from(fileData, 'base64');
-      const blob = new Blob([buffer]);
-      
-      // 上传到 Vercel Blob
-      const uniqueId = nanoid(10);
-      const uploadedBlob = await put(
-        `3d-models/${uniqueId}-${fileName}`,
-        blob,
-        {
-          access: 'public',
-          addRandomSuffix: false,
-        }
-      );
+  {
+    name: 'generate_3d_viewer',
+    description: 'Generate a 3D viewer web page for a GLB/GLTF file',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        modelUrl: {
+          type: 'string',
+          description: 'URL of the 3D model file',
+        },
+        title: {
+          type: 'string',
+          description: 'Page title',
+          default: '3D Model Viewer',
+        },
+        backgroundColor: {
+          type: 'string',
+          default: '#111',
+        },
+        cameraOrbit: {
+          type: 'string',
+          default: '45deg 75deg auto',
+        },
+        exposure: {
+          type: 'number',
+          default: 1,
+        },
+        shadowIntensity: {
+          type: 'number',
+          default: 0.6,
+        },
+      },
+      required: ['modelUrl'],
+    },
+  },
+  {
+    name: 'list_3d_files',
+    description: 'List all uploaded 3D model files',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+];
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              url: uploadedBlob.url,
-              downloadUrl: uploadedBlob.downloadUrl,
-              id: uniqueId,
-              metadata: metadata || {},
-            }),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: false,
-              error: (error as Error).message,
-            }),
-          },
-        ],
-        isError: true,
-      };
-    }
+// 工具执行函数
+async function executeTool(toolName: string, args: any) {
+  switch (toolName) {
+    case 'upload_3d_file':
+      return await uploadFile(args);
+    case 'generate_3d_viewer':
+      return await generateViewer(args);
+    case 'list_3d_files':
+      return await listFiles();
+    default:
+      throw new Error(`Unknown tool: ${toolName}`);
   }
-);
+}
 
-// 工具2: 生成 3D 预览网页
-server.tool(
-  'generate_3d_viewer',
-  'Generate a 3D viewer web page for a GLB/GLTF file',
-  {
-    modelUrl: z.string().url().describe('URL of the 3D model file'),
-    title: z.string().default('3D Model Viewer'),
-    backgroundColor: z.string().default('#111'),
-    cameraOrbit: z.string().default('45deg 75deg auto'),
-    exposure: z.number().default(1),
-    shadowIntensity: z.number().default(0.6),
-  },
-  async ({ modelUrl, title, backgroundColor, cameraOrbit, exposure, shadowIntensity }) => {
-        const htmlContent = `<!doctype html>
+async function uploadFile(args: any) {
+  try {
+    // 解码 Base64 并转换为 Blob
+    const buffer = Buffer.from(args.fileData, 'base64');
+    const blob = new Blob([buffer]);
+    
+    // 上传到 Vercel Blob
+    const uniqueId = nanoid(10);
+    const uploadedBlob = await put(
+      `3d-models/${uniqueId}-${args.fileName}`,
+      blob,
+      {
+        access: 'public',
+        addRandomSuffix: false,
+      }
+    );
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            url: uploadedBlob.url,
+            id: uniqueId,
+            metadata: args.metadata || {},
+          }),
+        },
+      ],
+    };
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: (error as Error).message,
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+async function generateViewer(args: any) {
+      const {
+    modelUrl,
+    title = '3D Model Viewer',
+    backgroundColor = '#111',
+    cameraOrbit = '45deg 75deg auto',
+    exposure = 1,
+    shadowIntensity = 0.6,
+  } = args;
+
+  const htmlContent = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -185,78 +246,136 @@ server.tool(
   </body>
 </html>`;
 
-    // 保存 HTML 到 Blob
-    const pageId = nanoid(10);
-    const htmlBlob = await put(
-      `3d-pages/${pageId}.html`,
-      htmlContent,
-      {
-        access: 'public',
-        addRandomSuffix: false,
-        contentType: 'text/html',
-      }
-    );
+  // 保存 HTML 到 Blob
+  const pageId = nanoid(10);
+  const htmlBlob = await put(
+    `3d-pages/${pageId}.html`,
+    htmlContent,
+    {
+      access: 'public',
+      addRandomSuffix: false,
+      contentType: 'text/html',
+    }
+  );
 
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          pageUrl: htmlBlob.url,
+          pageId: pageId,
+          modelUrl: modelUrl,
+        }),
+      },
+    ],
+  };
+}
+
+async function listFiles() {
+  try {
+    // 注意：这需要 Vercel Blob 的 list 功能
+    // 简化版本，返回提示信息
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify({
-            success: true,
-            pageUrl: htmlBlob.url,
-            pageId: pageId,
-            modelUrl: modelUrl,
+            message: 'List functionality requires Vercel Blob list API. Please check Vercel dashboard for file management.',
+            tip: 'Visit https://vercel.com/dashboard/stores/blob to manage your files',
           }),
         },
       ],
     };
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: (error as Error).message,
+          }),
+        },
+      ],
+      isError: true,
+    };
   }
-);
-
-// 工具3: 列出已上传的 3D 文件
-server.tool(
-  'list_3d_files',
-  'List all uploaded 3D model files',
-  {},
-  async () => {
-    try {
-      // 注意：这需要 Vercel Blob 的 list 功能
-      // 简化版本，返回提示信息
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              message: 'List functionality requires Vercel Blob list API. Please check Vercel dashboard for file management.',
-              tip: 'Visit https://vercel.com/dashboard/stores/blob to manage your files',
-            }),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: false,
-              error: (error as Error).message,
-            }),
-          },
-        ],
-        isError: true,
-      };
-    }
-  }
-);
-
-// 处理 Next.js API 路由请求
-export async function POST(request: NextRequest) {
-  const transport = new StreamableHTTPServerTransport('api/mcp', server);
-  return transport.handleRequest(request);
 }
 
-export async function GET(request: NextRequest) {
-  const transport = new StreamableHTTPServerTransport('api/mcp', server);
-  return transport.handleRequest(request);
+// 处理 MCP 协议请求
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    
+    // 处理 initialize 请求
+    if (body.method === 'initialize') {
+      return NextResponse.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: {
+            tools: {},
+          },
+          serverInfo: {
+            name: '3D File Storage MCP Server',
+            version: '1.0.0',
+          },
+        },
+      });
+    }
+
+    // 处理 tools/list 请求
+    if (body.method === 'tools/list') {
+      return NextResponse.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: {
+          tools,
+        },
+      });
+    }
+
+    // 处理 tools/call 请求
+    if (body.method === 'tools/call') {
+      const { name, arguments: args } = body.params;
+      const result = await executeTool(name, args || {});
+      
+      return NextResponse.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result,
+      });
+    }
+
+    // 未知方法
+    return NextResponse.json({
+      jsonrpc: '2.0',
+      id: body.id,
+      error: {
+        code: -32601,
+        message: 'Method not found',
+      },
+    });
+  } catch (error) {
+    return NextResponse.json({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32603,
+        message: (error as Error).message,
+      },
+    });
+  }
+}
+
+export async function GET() {
+  return NextResponse.json({
+    name: '3D File Storage MCP Server',
+    version: '1.0.0',
+    description: 'MCP Server for 3D model storage and web publishing',
+    tools: tools.map((t) => ({ name: t.name, description: t.description })),
+  });
 }
