@@ -1,13 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
-import { put } from '@vercel/blob';
+import { S3Client, PutObjectCommand, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { nanoid } from 'nanoid';
+
+// 初始化 S3 客户端（支持 Cloudflare R2、AWS S3 等）
+function getS3Client() {
+  const endpoint = process.env.S3_ENDPOINT || process.env.R2_ENDPOINT;
+  const accessKeyId = process.env.S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY;
+  
+  if (!endpoint || !accessKeyId || !secretAccessKey) {
+    throw new Error('S3 configuration missing. Please set S3_ENDPOINT, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY');
+  }
+
+  return new S3Client({
+    region: 'auto',
+    endpoint: endpoint,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+  });
+}
+
+const BUCKET_NAME = process.env.S3_BUCKET_NAME || process.env.R2_BUCKET_NAME || '3d-models';
 
 // MCP 工具定义
 const tools = [
   {
-    name: 'upload_3d_file',
-    description: 'Upload a 3D model file (GLB/GLTF) to cloud storage',
+    name: 's3_upload_file',
+    description: 'Upload a 3D model file (GLB/GLTF) to S3-compatible storage (Cloudflare R2, AWS S3, etc.)',
     inputSchema: {
       type: 'object',
       properties: {
@@ -18,6 +40,11 @@ const tools = [
         fileData: {
           type: 'string',
           description: 'Base64 encoded file data',
+        },
+        contentType: {
+          type: 'string',
+          description: 'MIME type (default: model/gltf-binary)',
+          default: 'model/gltf-binary',
         },
         metadata: {
           type: 'object',
@@ -31,6 +58,43 @@ const tools = [
     },
   },
   {
+    name: 's3_list_files',
+    description: 'List all uploaded files in S3-compatible storage',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prefix: {
+          type: 'string',
+          description: 'Filter by prefix (e.g., "3d-models/")',
+        },
+        maxKeys: {
+          type: 'number',
+          description: 'Maximum number of files to return (default: 100)',
+          default: 100,
+        },
+      },
+    },
+  },
+  {
+    name: 's3_get_presigned_url',
+    description: 'Get a presigned URL for accessing a file (valid for 1 hour)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fileName: {
+          type: 'string',
+          description: 'File name or key',
+        },
+        expiresIn: {
+          type: 'number',
+          description: 'URL expiration time in seconds (default: 3600)',
+          default: 3600,
+        },
+      },
+      required: ['fileName'],
+    },
+  },
+  {
     name: 'generate_3d_viewer',
     description: 'Generate a 3D viewer web page for a GLB/GLTF file',
     inputSchema: {
@@ -38,7 +102,7 @@ const tools = [
       properties: {
         modelUrl: {
           type: 'string',
-          description: 'URL of the 3D model file',
+          description: 'Public URL or presigned URL of the 3D model file',
         },
         title: {
           type: 'string',
@@ -65,46 +129,52 @@ const tools = [
       required: ['modelUrl'],
     },
   },
-  {
-    name: 'list_3d_files',
-    description: 'List all uploaded 3D model files',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
 ];
 
 // 工具执行函数
 async function executeTool(toolName: string, args: any) {
   switch (toolName) {
-    case 'upload_3d_file':
-      return await uploadFile(args);
+    case 's3_upload_file':
+      return await s3UploadFile(args);
+    case 's3_list_files':
+      return await s3ListFiles(args);
+    case 's3_get_presigned_url':
+      return await s3GetPresignedUrl(args);
     case 'generate_3d_viewer':
       return await generateViewer(args);
-    case 'list_3d_files':
-      return await listFiles();
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
 }
 
-async function uploadFile(args: any) {
+// S3 上传文件
+async function s3UploadFile(args: any) {
   try {
-    // 解码 Base64 并转换为 Blob
-    const buffer = Buffer.from(args.fileData, 'base64');
-    const blob = new Blob([buffer]);
+    const s3Client = getS3Client();
     
-    // 上传到 Vercel Blob
+    // 解码 Base64
+    const buffer = Buffer.from(args.fileData, 'base64');
+    
+    // 生成唯一文件名
     const uniqueId = nanoid(10);
-    const uploadedBlob = await put(
-      `3d-models/${uniqueId}-${args.fileName}`,
-      blob,
-      {
-        access: 'public',
-        addRandomSuffix: false,
-      }
-    );
+    const key = `3d-models/${uniqueId}-${args.fileName}`;
+    
+    // 上传到 S3
+    const command = new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: args.contentType || 'model/gltf-binary',
+      Metadata: args.metadata || {},
+    });
+    
+    await s3Client.send(command);
+    
+    // 生成公开 URL
+    const endpoint = process.env.S3_ENDPOINT || process.env.R2_ENDPOINT || '';
+    const publicUrl = process.env.S3_PUBLIC_URL 
+      ? `${process.env.S3_PUBLIC_URL}/${key}`
+      : `${endpoint}/${BUCKET_NAME}/${key}`;
 
     return {
       content: [
@@ -112,10 +182,12 @@ async function uploadFile(args: any) {
           type: 'text',
           text: JSON.stringify({
             success: true,
-            url: uploadedBlob.url,
+            key: key,
+            url: publicUrl,
             id: uniqueId,
+            bucket: BUCKET_NAME,
             metadata: args.metadata || {},
-          }),
+          }, null, 2),
         },
       ],
     };
@@ -127,7 +199,7 @@ async function uploadFile(args: any) {
           text: JSON.stringify({
             success: false,
             error: (error as Error).message,
-          }),
+          }, null, 2),
         },
       ],
       isError: true,
@@ -135,8 +207,101 @@ async function uploadFile(args: any) {
   }
 }
 
+// S3 列出文件
+async function s3ListFiles(args: any) {
+  try {
+    const s3Client = getS3Client();
+    
+    const command = new ListObjectsV2Command({
+      Bucket: BUCKET_NAME,
+      Prefix: args.prefix || '',
+      MaxKeys: args.maxKeys || 100,
+    });
+    
+    const response = await s3Client.send(command);
+    
+    const files = (response.Contents || []).map((item) => ({
+      key: item.Key,
+      size: item.Size,
+      lastModified: item.LastModified?.toISOString(),
+      etag: item.ETag,
+    }));
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            bucket: BUCKET_NAME,
+            count: files.length,
+            files: files,
+          }, null, 2),
+        },
+      ],
+    };
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: (error as Error).message,
+          }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+// S3 获取预签名 URL
+async function s3GetPresignedUrl(args: any) {
+  try {
+    const s3Client = getS3Client();
+    
+    const command = new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: args.fileName,
+    });
+    
+    const presignedUrl = await getSignedUrl(s3Client, command, {
+      expiresIn: args.expiresIn || 3600,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            url: presignedUrl,
+            expiresIn: args.expiresIn || 3600,
+            key: args.fileName,
+          }, null, 2),
+        },
+      ],
+    };
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: (error as Error).message,
+          }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+// 生成 3D 查看器
 async function generateViewer(args: any) {
-      const {
+  const {
     modelUrl,
     title = '3D Model Viewer',
     backgroundColor = '#111',
@@ -246,45 +411,36 @@ async function generateViewer(args: any) {
   </body>
 </html>`;
 
-  // 保存 HTML 到 Blob
-  const pageId = nanoid(10);
-  const htmlBlob = await put(
-    `3d-pages/${pageId}.html`,
-    htmlContent,
-    {
-      access: 'public',
-      addRandomSuffix: false,
-      contentType: 'text/html',
-    }
-  );
-
-  return {
-    content: [
-      {
-        type: 'text',
-        text: JSON.stringify({
-          success: true,
-          pageUrl: htmlBlob.url,
-          pageId: pageId,
-          modelUrl: modelUrl,
-        }),
-      },
-    ],
-  };
-}
-
-async function listFiles() {
+  // 将 HTML 上传到 S3
   try {
-    // 注意：这需要 Vercel Blob 的 list 功能
-    // 简化版本，返回提示信息
+    const s3Client = getS3Client();
+    const pageId = nanoid(10);
+    const key = `3d-pages/${pageId}.html`;
+    
+    const command = new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: htmlContent,
+      ContentType: 'text/html',
+    });
+    
+    await s3Client.send(command);
+    
+    const endpoint = process.env.S3_ENDPOINT || process.env.R2_ENDPOINT || '';
+    const pageUrl = process.env.S3_PUBLIC_URL 
+      ? `${process.env.S3_PUBLIC_URL}/${key}`
+      : `${endpoint}/${BUCKET_NAME}/${key}`;
+
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify({
-            message: 'List functionality requires Vercel Blob list API. Please check Vercel dashboard for file management.',
-            tip: 'Visit https://vercel.com/dashboard/stores/blob to manage your files',
-          }),
+            success: true,
+            pageUrl: pageUrl,
+            pageId: pageId,
+            modelUrl: modelUrl,
+          }, null, 2),
         },
       ],
     };
@@ -296,7 +452,8 @@ async function listFiles() {
           text: JSON.stringify({
             success: false,
             error: (error as Error).message,
-          }),
+            html: htmlContent,
+          }, null, 2),
         },
       ],
       isError: true,
@@ -320,8 +477,8 @@ export async function POST(request: NextRequest) {
             tools: {},
           },
           serverInfo: {
-            name: '3D File Storage MCP Server',
-            version: '1.0.0',
+            name: 'S3-Compatible 3D Storage MCP Server',
+            version: '2.0.0',
           },
         },
       });
@@ -373,9 +530,24 @@ export async function POST(request: NextRequest) {
 
 export async function GET() {
   return NextResponse.json({
-    name: '3D File Storage MCP Server',
-    version: '1.0.0',
-    description: 'MCP Server for 3D model storage and web publishing',
+    name: 'S3-Compatible 3D Storage MCP Server',
+    version: '2.0.0',
+    description: 'MCP Server for 3D model storage using S3-compatible APIs (Cloudflare R2, AWS S3, etc.)',
+    storage: {
+      type: 'S3-compatible',
+      supports: ['Cloudflare R2', 'AWS S3', 'MinIO', 'DigitalOcean Spaces', 'Backblaze B2'],
+    },
     tools: tools.map((t) => ({ name: t.name, description: t.description })),
+    configuration: {
+      required: [
+        'S3_ENDPOINT or R2_ENDPOINT',
+        'S3_ACCESS_KEY_ID or R2_ACCESS_KEY_ID',
+        'S3_SECRET_ACCESS_KEY or R2_SECRET_ACCESS_KEY',
+      ],
+      optional: [
+        'S3_BUCKET_NAME (default: 3d-models)',
+        'S3_PUBLIC_URL (for custom domain)',
+      ],
+    },
   });
 }
